@@ -1,3 +1,11 @@
+/*
+ * OpenSSL test program
+ *
+ * Written by Alex Gaynor and Paul Kehrer
+ *
+ * Modified by Christian Heimes
+ *
+ */
 #include <assert.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
@@ -8,6 +16,9 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
+#ifndef NO_TLS13
+#  define NO_TLS13 0
+#endif
 
 char SERVER_KEY[] = "-----BEGIN RSA PRIVATE KEY-----\n"
 "MIICWwIBAAKBgQC+pvhuud1dLaQQvzipdtlcTotgr5SuE2LvSx0gz/bg1U3u1eQ+\n"
@@ -102,8 +113,17 @@ void create_loopback(SSL **server, SSL **client) {
     int server_sock = accept(listener, NULL, NULL);
     assert_errno(server_sock != -1, "accept");
 
+    int options = SSL_OP_ALL & ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS;
+    options |= SSL_OP_CIPHER_SERVER_PREFERENCE;
+    options |= SSL_OP_SINGLE_DH_USE;
+    options |= SSL_OP_SINGLE_ECDH_USE;
+#if NO_TLS13
+    options |= SSL_OP_NO_TLSv1_3;
+#endif
+
     SSL_CTX *server_ctx = SSL_CTX_new(TLS_method());
     assert_openssl(server_ctx != NULL);
+    SSL_CTX_set_options(server_ctx, options);
     SSL_CTX_use_PrivateKey(server_ctx, load_privatekey(SERVER_KEY));
     SSL_CTX_use_certificate(server_ctx, load_certificate(SERVER_CERT));
     *server = SSL_new(server_ctx);
@@ -113,6 +133,7 @@ void create_loopback(SSL **server, SSL **client) {
 
     SSL_CTX *client_ctx = SSL_CTX_new(TLS_method());
     assert_openssl(client_ctx != NULL);
+    SSL_CTX_set_options(client_ctx, options);
     *client = SSL_new(client_ctx);
     SSL_set_mode(*client, SSL_MODE_AUTO_RETRY);
     assert_openssl(*client != NULL);
@@ -120,22 +141,25 @@ void create_loopback(SSL **server, SSL **client) {
     SSL_set_connect_state(*client);
 }
 
-void set_blocking(SSL *s, bool blocking) {
+void set_nonblocking(SSL *s, bool nonblocking) {
     int fd = SSL_get_fd(s);
     int flags = fcntl(fd, F_GETFL, 0);
     assert_errno(flags != -1, "fcntl");
-    if (blocking) {
-        flags = flags & (~O_NONBLOCK);
-    } else {
+    if (nonblocking) {
         flags |= O_NONBLOCK;
+    } else {
+        flags = flags & (~O_NONBLOCK);
     }
     flags = fcntl(fd, F_SETFL, flags);
     assert_errno(flags != -1, "fcntl");
+
+    BIO_set_nbio(SSL_get_rbio(s), nonblocking);
+    BIO_set_nbio(SSL_get_wbio(s), nonblocking);
 }
 
 void handshake(SSL *client, SSL *server) {
-    set_blocking(client, false);
-    set_blocking(server, false);
+    set_nonblocking(client, true);
+    set_nonblocking(server, true);
 
     SSL *conns[] = {client, server};
     int nconns = 2;
@@ -155,42 +179,62 @@ void handshake(SSL *client, SSL *server) {
         }
     }
 
-    set_blocking(client, true);
-    set_blocking(server, true);
+    printf("Server version: %s\n", SSL_get_version(server));
+    printf("Client version: %s\n", SSL_get_version(client));
+
+    set_nonblocking(client, false);
+    set_nonblocking(server, false);
+}
+
+void write_read(SSL *writer, SSL *reader) {
+    char out[4];
+
+    printf("Writing %s...\n", SSL_is_server(writer) ? "server" : "client");
+    int result = SSL_write(writer, "xyz", 3);
+    assert_openssl(result == 3);
+
+    printf("Reading %s...\n", SSL_is_server(reader) ? "server" : "client");
+    result = SSL_read(reader, out, 3);
+    if (result != 3) {
+        result = SSL_get_error(reader, result);
+        printf("OpenSSL error: %d\n", result);
+        exit(1);
+    }
+}
+
+void printerr(SSL *s, int result) {
+    printf("result: %d\n", result);
+    printf("SSL error: %d\n", SSL_get_error(s, result));
+    printf("errno: %d\n", errno);
+    printf("ERR: %lu\n", ERR_peek_error());
 }
 
 int main() {
     SSL *server, *client;
-    create_loopback(&server, &client);
+    int result;
 
+    create_loopback(&server, &client);
     handshake(client, server);
 
-    printf("Writing...\n");
-    int result = SSL_write(server, "xyz", 3);
-    assert_openssl(result == 3);
+    write_read(client, server);
+#if 0
+    write_read(server, client);
+#endif
 
-    char out[4];
-
-    printf("Reading...\n");
-    result = SSL_read(client, out, 3);
-    if (result != 3) {
-        result = SSL_get_error(client, result);
-        printf("OpenSSL error: %d\n", result);
-        exit(1);
-    }
     printf("Calling client shutdown once!\n");
     assert_openssl(ERR_get_error() == 0);
     if (SSL_shutdown(client) == 0) {
+        /* Disable read-ahead so that unwrap can work correctly. */
+        SSL_set_read_ahead(client, 0);
         printf("Calling client shutdown twice!\n");
         result = SSL_shutdown(client);
+        printerr(client, result);
         assert_openssl(result == 1);
         assert_openssl(ERR_get_error() == 0);
+
         printf("Calling server shutdown\n");
         result = SSL_shutdown(server);
-        printf("%d\n", result);
-        printf("%d\n", SSL_get_error(server, result));
-        printf("errno: %d\n", errno);
-        printf("err: %lu\n", ERR_get_error());
+        printerr(server, result);
         /* if (SSL_shutdown(server) == 0) { */
         /*     printf("Calling SSL shutdown client 2x"); */
         /*     assert_openssl(ERR_get_error() == 0); */
@@ -201,4 +245,3 @@ int main() {
         /* } */
     }
 }
-
